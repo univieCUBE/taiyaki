@@ -1640,6 +1640,55 @@ class GlobalNormFlipFlopCatMod(nn.Module):
         return torch.cat((trans_scores, cat_mod_scores), dim=2)
 
 
+class ModifiedBasesClassifier(nn.Module):
+    """ Classify read as 'modified' or using """
+    def __init__(
+            self,
+            alphabet_info,
+            pooling_strategy: str = "avg",
+            pool_size: int = 1_000,
+    ):
+        super().__init__()
+        self.can_bases = alphabet_info.can_bases
+        self.mod_bases = alphabet_info.mod_bases
+        self.ncan_base = alphabet_info.ncan_base
+        self.nmod_base = alphabet_info.nmod_base
+
+        self.pool_size = pool_size
+        if pooling_strategy == "avg":
+            self.adaptivePool1d = nn.AdaptiveAvgPool1d(output_size=pool_size)
+        elif pooling_strategy == "max":
+            self.adaptivePool1d = nn.AdaptiveMaxPool1d(output_size=pool_size)
+        else:
+            raise ValueError(f"Unknown pooling strategy: '{pooling_strategy}'")
+        # TODO get rid of hard-coded in_features,
+        self.classification = nn.Linear(
+            in_features=48 * self.pool_size,
+            out_features=2,
+        )
+
+    @property
+    def nbase(self):
+        """ Number of canonical bases
+
+        Returns:
+            int: Number of canonical bases
+        """
+        return self.ncan_base
+
+    def forward(self, x):
+        # x.shape = (n_bases, n_reads, layer_size, )
+        x = x.permute(1, 2, 0).contiguous()
+        # x.shape = (n_reads, layer_size, n_bases, )
+        x = self.adaptivePool1d(x)
+        # x.shape = (n_reads, layer_size, self.pool_size, )
+        x = x.flatten(start_dim=1)
+        # x.shape = (n_reads, layer_size * self.pool_size
+        x = self.classification(x)
+        # x.shape = (n_reads, 2, )
+        return x
+
+
 def is_cat_mod_model(net):
     """ Is model a categorical modified base model
 
@@ -1653,7 +1702,17 @@ def is_cat_mod_model(net):
         bool: True if final layer is categorical mod base, False otherwise
     """
     assert isinstance(net, Serial)
-    return isinstance(net.sublayers[-1], GlobalNormFlipFlopCatMod)
+    last_layer = net.sublayers[-1]
+    second_last_layer = net.sublayers[-2]
+    if isinstance(last_layer, ModifiedBasesClassifier):
+        return isinstance(second_last_layer, GlobalNormFlipFlopCatMod)
+    else:
+        return isinstance(last_layer, GlobalNormFlipFlopCatMod)
+
+
+def is_classifier(net):
+    assert isinstance(net, Serial)
+    return isinstance(net.sublayers[-1], ModifiedBasesClassifier)
 
 
 class TimeLinear(nn.Module):

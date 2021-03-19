@@ -2,6 +2,7 @@
 from collections import defaultdict, namedtuple
 from itertools import islice
 import math
+import random
 import numpy as np
 import os
 from shutil import copyfile
@@ -9,6 +10,7 @@ import sys
 import time
 
 import torch
+from torch import nn
 
 from taiyaki import (
     chunk_selection, ctc, flipflopfings, helpers, layers,
@@ -34,7 +36,9 @@ LOGS.__new__.__defaults__ = (None, None, None)
 
 NETWORK_METADATA = namedtuple('NETWORK_METADATA', (
     'reverse', 'standardize', 'is_cat_mod', 'can_mods_offsets',
-    'can_labels', 'mod_labels'))
+    'can_labels', 'mod_labels',
+    'is_classifier',
+))
 NETWORK_METADATA.__new__.__defaults__ = (None, None, None)
 NETWORK_INFO = namedtuple('NETWORK_INFO', (
     'net', 'net_clone', 'metadata', 'stride'))
@@ -52,7 +56,11 @@ BATCH_FIELDS = [
     'chunk_len']
 BATCH_TMPLT = '\t'.join('{}' for _ in BATCH_FIELDS) + '\n'
 BATCH_HEADER = BATCH_TMPLT.format(*BATCH_FIELDS)
-VAL_FIELDS = ['iter', 'loss']
+ACC_BATCH_FIELDS = ['iter', 'loss', 'acc', 'gradientmax', 'gradientcap',
+                    'learning_rate', 'chunk_len']
+ACC_BATCH_TMPLT = '\t'.join('{}' for _ in ACC_BATCH_FIELDS) + '\n'
+ACC_BATCH_HEADER = ACC_BATCH_TMPLT.format(*ACC_BATCH_FIELDS)
+VAL_FIELDS = ['iter', 'loss', 'acc']
 VAL_TMPLT = '\t'.join('{}' for _ in VAL_FIELDS) + '\n'
 VAL_HEADER = VAL_TMPLT.format(*VAL_FIELDS)
 
@@ -65,12 +73,23 @@ MAIN_LOG_VAL_TMPLT = (
 
 
 def parse_network_metadata(network):
+    if layers.is_classifier(network):
+        return NETWORK_METADATA(
+            network.metadata['reverse'], network.metadata['standardize'],
+            is_cat_mod=True,
+            can_mods_offsets=network.sublayers[-2].can_mods_offsets,
+            can_labels=network.sublayers[-2].can_labels,
+            mod_labels=network.sublayers[-2].mod_labels,
+            is_classifier=True,
+        )
     if layers.is_cat_mod_model(network):
         return NETWORK_METADATA(
             network.metadata['reverse'], network.metadata['standardize'],
             True, network.sublayers[-1].can_mods_offsets,
             network.sublayers[-1].can_labels,
-            network.sublayers[-1].mod_labels)
+            network.sublayers[-1].mod_labels,
+            is_classifier=False,
+        )
     return NETWORK_METADATA(
         network.metadata['reverse'], network.metadata['standardize'], False)
 
@@ -78,7 +97,8 @@ def parse_network_metadata(network):
 def prepare_random_batches(
         read_data, batch_chunk_len, sub_batch_size, target_sub_batches,
         alphabet_info, filter_params, net_info, log,
-        select_strands_randomly=True, first_strand_index=0, pin=True):
+        select_strands_randomly=True, first_strand_index=0, pin=True,
+        target_data=None):
     total_sub_batches = 0
     if net_info.metadata.reverse:
         revop = np.flip
@@ -88,11 +108,18 @@ def prepare_random_batches(
     while total_sub_batches < target_sub_batches:
 
         # Chunk_batch is a list of dicts
-        chunk_batch, batch_rejections = chunk_selection.sample_chunks(
+        chunk_selection_output = chunk_selection.sample_chunks(
             read_data, sub_batch_size, batch_chunk_len, filter_params,
             standardize=net_info.metadata.standardize,
             select_strands_randomly=select_strands_randomly,
-            first_strand_index=first_strand_index)
+            first_strand_index=first_strand_index,
+            target_data=target_data,
+        )
+        try:
+            chunk_batch, batch_rejections, target = chunk_selection_output
+        except ValueError:
+            chunk_batch, batch_rejections = chunk_selection_output
+            target = None
         first_strand_index += sum(batch_rejections.values())
         if len(chunk_batch) < sub_batch_size:
             log.write(('* Warning: only {} chunks passed filters ' +
@@ -108,10 +135,16 @@ def prepare_random_batches(
         #     batch_chunk_len x sub_batch_size x 1
         stacked_current = np.vstack([
             revop(chunk.current) for chunk in chunk_batch]).T
+        if target is not None:
+            stacked_target = np.concatenate(target).astype(np.int64)
+            intarget = torch.tensor(stacked_target, device='cpu',
+                                    dtype=torch.long)
         indata = torch.tensor(stacked_current, device='cpu',
                               dtype=torch.float32).unsqueeze(2)
         if pin and torch.cuda.is_available():
             indata = indata.pin_memory()
+            if target is not None:
+                intarget = intarget.pin_memory()
 
         # Prepare seqs, seqlens and (if necessary) mod_cats
         seqs, seqlens = [], []
@@ -139,7 +172,10 @@ def prepare_random_batches(
 
         total_sub_batches += 1
 
-        yield indata, seqs, seqlens, mod_cats, sub_batch_size, batch_rejections
+        if target_data is None:
+            yield indata, seqs, seqlens, mod_cats, sub_batch_size, batch_rejections
+        else:
+            yield indata, seqs, seqlens, mod_cats, sub_batch_size, batch_rejections, intarget
 
 
 def calculate_loss(
@@ -148,9 +184,11 @@ def calculate_loss(
     can_mods_offsets = net_info.metadata.can_mods_offsets
     total_chunk_count = total_fval = total_samples = total_bases = \
         n_subbatches = 0
+    total_correct: int = 0
     rejection_dict = defaultdict(int)
+    bce_loss = nn.CrossEntropyLoss()  # Only used in classification mode  # TODO BCELossWithLogits
     for (indata, seqs, seqlens, mod_cats, sub_batch_size,
-         batch_rejections) in batch_gen:
+         batch_rejections, target) in batch_gen:
         n_subbatches += 1
         # Update counts of reasons for rejection
         for k, v in batch_rejections.items():
@@ -161,19 +199,24 @@ def calculate_loss(
         with torch.set_grad_enabled(calc_grads):
             outputs = net_info.net(indata.to(
                 get_model_device(net_info.net), non_blocking=True))
-            nblk = float(outputs.shape[0])
-            ntrans = outputs.shape[2]
-            if net_info.metadata.is_cat_mod:
-                lossvector = ctc.cat_mod_flipflop_loss(
-                    outputs, seqs, seqlens, mod_cats, can_mods_offsets,
-                    mod_cat_weights * mod_factor, sharpen)
-                ntrans -= can_mods_offsets[-1]
+            if net_info.metadata.is_classifier:
+                target = target.to(get_model_device(net_info.net))
+                lossvector = bce_loss(outputs, target)
+                _, preds = torch.max(outputs, dim=1)
             else:
-                lossvector = ctc.crf_flipflop_loss(
-                    outputs, seqs, seqlens, sharpen)
+                nblk = float(outputs.shape[0])
+                ntrans = outputs.shape[2]
+                if net_info.metadata.is_cat_mod:
+                    lossvector = ctc.cat_mod_flipflop_loss(
+                        outputs, seqs, seqlens, mod_cats, can_mods_offsets,
+                        mod_cat_weights * mod_factor, sharpen)
+                    ntrans -= can_mods_offsets[-1]
+                else:
+                    lossvector = ctc.crf_flipflop_loss(
+                        outputs, seqs, seqlens, sharpen)
 
-            lossvector += layers.flipflop_logpartition(
-                outputs[:, :, :ntrans]) / nblk
+                lossvector += layers.flipflop_logpartition(
+                    outputs[:, :, :ntrans]) / nblk
 
             # In multi-GPU mode, gradients are synchronised when
             # loss.backward() is called. We need to make sure we are
@@ -186,6 +229,9 @@ def calculate_loss(
 
         fval = float(loss)
         total_fval += fval
+        if net_info.metadata.is_classifier:
+            correct_preds = preds.detach().cpu().numpy() == target.detach().cpu().numpy()
+            total_correct += correct_preds.sum()
         total_samples += int(indata.nelement())
         total_bases += int(seqlens.sum())
 
@@ -194,8 +240,14 @@ def calculate_loss(
             if p.grad is not None:
                 p.grad /= n_subbatches
 
-    return total_chunk_count, total_fval / n_subbatches, \
-        total_samples, total_bases, rejection_dict
+    return (
+        total_chunk_count,
+        total_fval / n_subbatches,
+        total_samples,
+        total_bases,
+        rejection_dict,
+        total_correct,
+    )
 
 
 def apply_clipping(net_info, grad_max_threshs):
@@ -234,7 +286,7 @@ def parse_init_args(args):
                        'w', buffering=1),
             validation=open(os.path.join(args.outdir, VAL_LOG_FILENAME),
                             'w', buffering=1))
-        logs.batch.write(BATCH_HEADER)
+        logs.batch.write(ACC_BATCH_HEADER)
         logs.validation.write(VAL_HEADER)
 
         if args.save_every % DOTROWLENGTH != 0:
@@ -273,6 +325,7 @@ def parse_init_args(args):
     # set random seed for this process
     np.random.seed(seed)
     torch.manual_seed(seed)
+    random.seed(seed)
     if _MAKE_TORCH_DETERMINISTIC and device.type == 'cuda':
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
@@ -282,7 +335,10 @@ def parse_init_args(args):
 
 def load_data(args, log, res_info):
     log.write('* Loading data from {}\n'.format(args.input))
-    log.write('* Per read file MD5 {}\n'.format(helpers.file_md5(args.input)))
+    log.write('* Per read file MD5 ')
+    log.write('(omitted for faster debugging)\n')  # TODO remove after debug
+    # TODO log.write('{}\n'.format(helpers.file_md5(args.input)))
+    load_targets = args.target_file is not None
 
     if args.input_strand_list is not None:
         read_ids = list(set(helpers.get_read_ids(args.input_strand_list)))
@@ -306,6 +362,40 @@ def load_data(args, log, res_info):
         exit(1)
     log.write('* Loaded {} reads.\n'.format(len(read_data)))
 
+    if load_targets:
+        log.write(f'* loading targets for classification from {args.target_file}\n')
+        import pandas as pd
+        df_target = pd.read_csv(
+            args.target_file,
+            names=["read_id", "target"],
+            header=None,
+            index_col=0,
+        )
+        if read_ids is None:
+            use_read_ids = np.array([x.read_id for x in read_data])
+        else:
+            use_read_ids = read_ids
+        df_read_ids = pd.DataFrame(use_read_ids, columns=["read_id"])
+        target_data = df_read_ids.merge(
+            df_target,
+            left_on="read_id",
+            right_on="read_id",
+            how="left",
+        )
+        log.write(f'* Using {target_data.shape[0]} labels from {df_target.shape[0]} loaded.\n')
+        assert np.all(use_read_ids == target_data.read_id), "Reads and labels are not aligned!"
+        target_data = target_data[["target"]].values
+
+        # Shuffle both lists (identically), so that we don't end up with all
+        # identical classes within individual minibatches.
+        # (B/c this effectively kills the gradient quickly).
+        reads_targets = list(zip(read_data, target_data))
+        random.shuffle(reads_targets)
+        read_data, target_data = zip(*reads_targets)
+    else:
+        log.write('* Not loading per-read targets (not in classification mode)\n')
+        target_data = None
+
     # mod cat inv freq weighting is currently disabled. Compute and set this
     # value to enable mod cat weighting
     # prepare modified base paramter tensors
@@ -326,7 +416,7 @@ def load_data(args, log, res_info):
                                                  mod_cat_weights))))
     mod_info = MOD_INFO(mod_cat_weights, args.mod_factor)
 
-    return read_data, alphabet_info, mod_info
+    return read_data, alphabet_info, mod_info, target_data
 
 
 def load_network(args, alphabet_info, res_info, log):
@@ -351,11 +441,19 @@ def load_network(args, alphabet_info, res_info, log):
             sum(p.nelement() for p in net_clone.parameters())))
 
         if not alphabet_info.is_compatible_model(net_clone):
-            sys.stderr.write(
-                '* ERROR: Model and mapped signal files contain ' +
-                'incompatible alphabet definitions (including modified ' +
-                'bases).')
-            sys.exit(1)
+            if args.target_file is not None:
+                sys.stderr.write(
+                    '* WARNING: Model and mapped signal files contain ' +
+                    'incompatible alphabet definitions (including modified ' +
+                    'bases) - BUT: we are using the not yet completely '
+                    'developed classification mode, so continue and hope '
+                    'for the best...')
+            else:
+                sys.stderr.write(
+                    '* ERROR: Model and mapped signal files contain ' +
+                    'incompatible alphabet definitions (including modified ' +
+                    'bases).')
+                sys.exit(1)
         if layers.is_cat_mod_model(net_clone):
             log.write('* Loaded categorical modified base model.\n')
             if not alphabet_info.contains_modified_bases():
@@ -461,7 +559,7 @@ def load_network(args, alphabet_info, res_info, log):
     return net_info, optim_info
 
 
-def compute_filter_params(args, net_info, read_data, log):
+def compute_filter_params(args, net_info, read_data, log, target_data=None):
     # Get parameters for filtering by sampling a subset of the reads
     # Result is a tuple median mean_dwell, mad mean_dwell
     # Choose a chunk length in the middle of the range for this, forcing
@@ -473,7 +571,9 @@ def compute_filter_params(args, net_info, read_data, log):
         read_data, args.sample_nreads_before_filtering, sampling_chunk_len,
         args.filter_mean_dwell, args.filter_max_dwell,
         args.filter_min_pass_fraction, net_info.stride,
-        args.filter_path_buffer)
+        args.filter_path_buffer,
+        target_data=target_data,
+    )
     log.write((
         '* Sampled {} chunks: median(mean_dwell)={:.2f}, mad(mean_dwell)=' +
         '{:.2f}\n').format(
@@ -485,7 +585,7 @@ def compute_filter_params(args, net_info, read_data, log):
 
 def extract_reporting_data(
         args, read_data, res_info, alphabet_info, filter_params, net_info,
-        log):
+        log, target_data=None):
     # Generate list of batches for standard loss reporting
     all_read_ids = [read.read_id for read in read_data]
     if args.reporting_strand_list is not None:
@@ -511,7 +611,9 @@ def extract_reporting_data(
     reporting_batch_list = list(prepare_random_batches(
         report_read_data, reporting_chunk_len,
         args.min_sub_batch_size, args.reporting_sub_batches, alphabet_info,
-        filter_params, net_info, log, select_strands_randomly=False))
+        filter_params, net_info, log, select_strands_randomly=False,
+        target_data=target_data,
+    ))
     log.write((
         '* Standard loss report: chunk length = {} & sub-batch size = {} ' +
         'for {} sub-batches. \n').format(
@@ -531,7 +633,8 @@ def parse_train_params(args):
 
 def train_model(
         train_params, net_info, optim_info, res_info, read_data, alphabet_info,
-        filter_params, mod_info, reporting_batch_list, logs):
+        filter_params, mod_info, reporting_batch_list, logs,
+        target_data):
     # Set cap at very large value (before we have any gradient stats).
     grad_max_threshs = None
     grad_max_thresh_str = 'NaN'
@@ -564,14 +667,18 @@ def train_model(
         main_batch_gen = prepare_random_batches(
             read_data, batch_chunk_len, sub_batch_size,
             train_params.sub_batches, alphabet_info, filter_params, net_info,
-            logs.main)
+            logs.main,
+            target_data=target_data,
+        )
 
         # take optimiser step
         optim_info.optimiser.zero_grad()
-        chunk_count, fval, chunk_samples, chunk_bases, batch_rejections = \
+        chunk_count, fval, chunk_samples, chunk_bases, batch_rejections, correct = \
             calculate_loss(
                 net_info, main_batch_gen, sharpen, mod_info.mod_cat_weights,
-                mod_factor, calc_grads=True)
+                mod_factor, calc_grads=True,
+            )
+        acc: float = correct / chunk_samples
         grad_maxs = apply_clipping(net_info, grad_max_threshs)
         optim_info.optimiser.step()
         if optim_info.rolling_mads is not None:
@@ -581,8 +688,8 @@ def train_model(
             grad_max_thresh_str = ','.join((
                 'NA' if l_gmt is None else str(float(l_gmt))
                 for l_gmt in grad_maxs))
-            logs.batch.write(BATCH_TMPLT.format(
-                curr_iter + 1, fval, ','.join(map(str, grad_maxs)),
+            logs.batch.write(ACC_BATCH_TMPLT.format(
+                curr_iter + 1, fval, acc, ','.join(map(str, grad_maxs)),
                 grad_max_thresh_str, optim_info.lr_scheduler.get_last_lr()[0],
                 batch_chunk_len))
 
@@ -674,29 +781,46 @@ def log_validation(
         net_info, reporting_batch_list, train_params, mod_info, curr_iter,
         logs):
     t0 = time.time()
-    _, rloss, _, total_bases, _ = calculate_loss(
+    _, rloss, n_samples, total_bases, _, n_correct = calculate_loss(
         net_info, reporting_batch_list, train_params.sharpen.max,
         mod_info.mod_cat_weights, mod_info.mod_factor.final)
     dt = time.time() - t0
+    acc: float = n_correct / n_samples
     kbases = total_bases / 1e3
     logs.main.write(MAIN_LOG_VAL_TMPLT.format(
         curr_iter + 1, rloss, kbases / 1e3, dt, kbases / dt))
-    logs.validation.write(VAL_TMPLT.format(curr_iter + 1, rloss))
+    logs.validation.write(VAL_TMPLT.format(curr_iter + 1, rloss, acc))
 
 
 def main(args):
     res_info, logs = parse_init_args(args)
-    read_data, alphabet_info, mod_info = load_data(args, logs.main, res_info)
+    read_data, alphabet_info, mod_info, target_data = load_data(
+        args, logs.main, res_info)
     net_info, optim_info = load_network(
         args, alphabet_info, res_info, logs.main)
-    filter_params = compute_filter_params(args, net_info, read_data, logs.main)
+    filter_params = compute_filter_params(
+        args,
+        net_info,
+        read_data,
+        logs.main,
+        target_data=target_data,
+    )
     reporting_batch_list = extract_reporting_data(
-        args, read_data, res_info, alphabet_info, filter_params, net_info,
-        logs.main)
+        args,
+        read_data,
+        res_info,
+        alphabet_info,
+        filter_params,
+        net_info,
+        logs.main,
+        target_data=target_data,
+    )
     train_params = parse_train_params(args)
     train_model(
         train_params, net_info, optim_info, res_info, read_data, alphabet_info,
-        filter_params, mod_info, reporting_batch_list, logs)
+        filter_params, mod_info, reporting_batch_list, logs,
+        target_data=target_data,
+    )
 
 
 if __name__ == '__main__':

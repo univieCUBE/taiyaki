@@ -157,6 +157,9 @@ def guess_model_stride(net, input_shape=(720, 1, 1)):
     Returns:
         int : stride of the network model
     """
+    from .layers import ModifiedBasesClassifier
+    if isinstance(net.sublayers[-1], ModifiedBasesClassifier):
+        return 1  # TODO adaption to general case required
     net_device = get_model_device(net)
     out = net(torch.zeros(input_shape).to(net_device))
     return int(round(input_shape[0] / out.size()[0]))

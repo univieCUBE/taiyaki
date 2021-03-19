@@ -205,4 +205,10 @@ def get_train_flipflop_parser():
         'input', action=FileExists,
         help='file containing mapped reads')
 
+    parser.add_argument(
+        "--target_file", action=FileExists,
+        help="Classification ground-truth labels (targets) in .csv format",
+        default=None,
+    )
+
     return parser

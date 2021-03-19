@@ -26,10 +26,15 @@ class FILTER_PARAMETERS(namedtuple(
     """
 
 
+class Nothing:
+    def __getitem__(self, item):
+        return None
+
+
 def sample_chunks(read_data, number_to_sample, chunk_len, filter_params,
                   chunk_len_means_sequence_len=False,
                   standardize=True, select_strands_randomly=True,
-                  first_strand_index=0):
+                  first_strand_index=0, target_data=None):
     """ Sample <number_to_sample> chunks from a list of read_data, returning
     a tuple (chunklist, rejection_dict).
 
@@ -62,6 +67,7 @@ def sample_chunks(read_data, number_to_sample, chunk_len, filter_params,
             in read_data.
         first_strand_index : When select_strands_randomly=False, begin
             selecting strands at this index.
+        target_data : Ground-truth labels, if classification.
     """
     nreads = len(read_data)
     if number_to_sample is None or number_to_sample == 0:
@@ -71,6 +77,12 @@ def sample_chunks(read_data, number_to_sample, chunk_len, filter_params,
     maximum_attempts_allowed = int(
         number_to_sample_used / filter_params.filter_min_pass_fraction)
     chunks = []
+    if target_data is None:
+        is_classif = False
+        target_data = Nothing()
+    else:
+        is_classif = True
+    target = []
     # Will contain counts of numbers of rejects and passes
     rejection_reasons = defaultdict(lambda: 0)
     attempts = 0
@@ -81,6 +93,7 @@ def sample_chunks(read_data, number_to_sample, chunk_len, filter_params,
             (first_strand_index + attempts) % nreads)
         attempts += 1
         read = read_data[read_number]
+        t = target_data[read_number]
         if chunk_len_means_sequence_len:
             chunk = read.get_chunk_with_sequence_length(
                 chunk_len, standardize=standardize)
@@ -91,15 +104,22 @@ def sample_chunks(read_data, number_to_sample, chunk_len, filter_params,
         rejection_reasons[chunk.reject_reason] += 1
         if chunk.accepted:
             chunks.append(chunk)
-
-    return chunks, rejection_reasons
+            if is_classif:
+                target.append(t)
+        else:
+            pass
+    if is_classif:
+        return chunks, rejection_reasons, target
+    else:
+        return chunks, rejection_reasons
 
 
 def sample_filter_parameters(read_data, number_to_sample, chunk_len,
                              filter_mean_dwell, filter_max_dwell,
                              filter_min_pass_fraction,
                              model_stride, path_buffer,
-                             chunk_len_means_sequence_len=False):
+                             chunk_len_means_sequence_len=False,
+                             target_data=None):
     """ Sample number_to_sample reads from read_data, calculate median and MAD
     of mean dwell. Note the MAD has an adjustment factor so that it would give
     the same result as the std for a normal distribution.
@@ -111,9 +131,12 @@ def sample_filter_parameters(read_data, number_to_sample, chunk_len,
         filter_min_pass_fraction=filter_min_pass_fraction,
         median_meandwell=None, mad_meandwell=None,
         model_stride=None, path_buffer=None)
-    chunks, _ = sample_chunks(
+    chunk_selection_output = sample_chunks(
         read_data, number_to_sample, chunk_len, no_filter_params,
-        chunk_len_means_sequence_len=chunk_len_means_sequence_len)
+        chunk_len_means_sequence_len=chunk_len_means_sequence_len,
+        target_data=target_data,
+    )
+    chunks = chunk_selection_output[0]
     meandwells = [chunk.mean_dwell for chunk in chunks]
     median_meandwell, mad_meandwell = med_mad(meandwells)
     return FILTER_PARAMETERS(
